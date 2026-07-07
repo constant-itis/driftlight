@@ -7,14 +7,7 @@ dark and, where they pass, bioluminescent points flare cyan-green and slowly
 fade. Occasionally a shimmer sweeps across the water. It's slow, sparse, and
 low-luminance — built to be watched, or half-watched, while you breathe.
 
-```
-       ·           ∙
-   •                     ·
-         ∙     ·
-                •          ∙
-   ·                            ·
-         ·          •
-```
+![driftlight in motion](assets/demo.gif)
 
 Pure Python 3 standard library. No dependencies. One file. MIT licensed.
 
