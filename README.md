@@ -32,7 +32,27 @@ Or just run it in place:
 ./driftlight
 ```
 
-Quit any time with **Ctrl-C** or **q**.
+## Controls
+
+driftlight is interactive while it runs:
+
+| key | action |
+|-----|--------|
+| `h` | toggle the help panel |
+| `s` | open the settings panel — change palette, density, breath, etc. **live** |
+| `q` / `Ctrl-C` | quit |
+| `esc` | close an open panel (or quit if none is open) |
+
+In the settings panel:
+
+| key | action |
+|-----|--------|
+| `j` / `k` or `↑` / `↓` | move the selection |
+| `←` / `→` or `-` / `+` | change the selected value |
+| `space` | toggle / cycle the selected value |
+
+Every setting below can be changed live from the `s` panel without restarting —
+handy for finding the density and palette that feel right for your terminal.
 
 ## Why it's calm (and cmatrix isn't)
 

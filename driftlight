@@ -25,6 +25,7 @@ import argparse
 import math
 import os
 import random
+import select
 import shutil
 import signal
 import sys
@@ -200,6 +201,102 @@ class Scene:
         self.shimmer_pos = 0.0
         self.shimmer_dir = 1
         self.next_shimmer = 6.0
+        # interactive state
+        self.fps = args.fps
+        self.overlay = None          # None | 'help' | 'settings'
+        self.sel = 0                 # selected settings row
+        self.panel_rect = None       # (top, left, h, w) of open overlay
+        self._clear_rect = None      # region to blank after a panel closes
+        self._panel_payload = None
+        self._hint_done = False
+        self.breath_opts = ["off", "4-7-8", "4-4-4-4", "5-5-5", "6-3-9"]
+        self.fields = self._build_fields()
+
+    def _build_fields(self):
+        pals = sorted(PALETTES)
+
+        def cyc(lst, cur, d):
+            cur = cur if cur in lst else lst[0]
+            return lst[(lst.index(cur) + d) % len(lst)]
+
+        def set_pal(d):
+            self.args.palette = cyc(pals, self.args.palette, d)
+            self.peak = PALETTES[self.args.palette]
+            self.hue_jitter = 0.45 if self.args.palette == "aurora" else 0.22
+
+        def set_density(d):
+            self.args.density = round(clamp(self.args.density + d * 0.1, 0.1, 3.0), 1)
+
+        def set_linger(d):
+            self.args.linger = round(clamp(self.args.linger + d * 0.2, 0.5, 12.0), 1)
+
+        def set_breath(d):
+            self.args.breath = cyc(self.breath_opts, self.args.breath, d)
+            self.breath = Breath(self.args.breath)
+
+        def set_fps(d):
+            self.fps = int(clamp(self.fps + d * 2, 8, 60))
+
+        def set_weather(d):
+            self.args.weather = round(clamp(self.args.weather + d, 0, 30))
+
+        def toggle(attr):
+            return lambda d: setattr(self.args, attr, not getattr(self.args, attr))
+
+        onoff = lambda b: "on" if b else "off"
+        return [
+            {"label": "Palette",   "val": lambda: self.args.palette,             "change": set_pal},
+            {"label": "Density",   "val": lambda: f"{self.args.density:.1f}",    "change": set_density},
+            {"label": "Linger",    "val": lambda: f"{self.args.linger:.1f}s",    "change": set_linger},
+            {"label": "Breath",    "val": lambda: self.args.breath,              "change": set_breath},
+            {"label": "FPS",       "val": lambda: str(self.fps),                 "change": set_fps},
+            {"label": "Weather",   "val": lambda: "off" if not self.args.weather else f"{int(self.args.weather)}min", "change": set_weather},
+            {"label": "Circadian", "val": lambda: onoff(self.args.circadian),    "change": toggle("circadian")},
+            {"label": "Shimmer",   "val": lambda: onoff(self.args.shimmer),      "change": toggle("shimmer")},
+            {"label": "Indicator", "val": lambda: onoff(self.args.indicator),    "change": toggle("indicator")},
+        ]
+
+    # ---- interactive key handling ------------------------------------------
+
+    def set_overlay(self, kind):
+        if self.overlay and self.panel_rect:
+            self._clear_rect = self.panel_rect
+        self.overlay = kind
+        self.sel = 0
+        self.panel_rect = None
+
+    def handle_key(self, key):
+        """Return 'quit' to stop; otherwise mutate overlay/settings state."""
+        if key == "q":
+            return "quit"
+        if self.overlay is None:
+            if key == "h":
+                self.set_overlay("help")
+            elif key == "s":
+                self.set_overlay("settings")
+            elif key == "esc":
+                return "quit"
+            return None
+        if self.overlay == "help":
+            if key in ("esc", "h"):
+                self.set_overlay(None)
+            elif key == "s":
+                self.set_overlay("settings")
+            return None
+        # settings
+        if key in ("esc", "s"):
+            self.set_overlay(None)
+            return None
+        n = len(self.fields)
+        if key in ("up", "k"):
+            self.sel = (self.sel - 1) % n
+        elif key in ("down", "j"):
+            self.sel = (self.sel + 1) % n
+        elif key in ("left", "-", "_", ","):
+            self.fields[self.sel]["change"](-1)
+        elif key in ("right", "+", "=", ".", "space", "enter"):
+            self.fields[self.sel]["change"](+1)
+        return None
 
     def set_size(self):
         sz = shutil.get_terminal_size((80, 24))
@@ -209,8 +306,8 @@ class Scene:
         self.disp.clear()
 
     # per-frame decay factor from fps + linger seconds
-    def decay(self, fps):
-        frames = max(1.0, self.args.linger * fps)
+    def decay(self):
+        frames = max(1.0, self.args.linger * self.fps)
         return self.eps ** (1.0 / frames)
 
     def field(self, x, y, t):
@@ -283,16 +380,27 @@ class Scene:
         q = lambda v: (v // 6) * 6
         return q(r), q(g), q(b)
 
-    def render_frame(self, t, dt, fps, out):
+    def render_frame(self, t, dt, out):
+        # blank a panel region that was just closed, then re-plan any open panel
+        if self._clear_rect:
+            self._emit_clear(self._clear_rect, out)
+            self._clear_rect = None
+        if self.overlay:
+            self._prepare_panel()
+        else:
+            self.panel_rect = None
+
         env, spawn_mult, blabel = self.breath.at(t)
         dim, warmth = circadian(datetime.now(), self.args.circadian)
         sleepf = self._sleep_factor(t)
         gbright = dim * (0.3 + 0.7 * sleepf)  # sleep dims too, never fully 0 mid-run
 
         self.update_shimmer(t, dt)
-        self.spawn(t, spawn_mult, 0.9 + 0.5 * math.sin(t / (self.args.weather * 60.0)) if self.args.weather else 1.0, sleepf)
+        weather = (0.9 + 0.5 * math.sin(t / (self.args.weather * 60.0))
+                   if self.args.weather else 1.0)
+        self.spawn(t, spawn_mult, weather, sleepf)
 
-        dec = self.decay(fps)
+        dec = self.decay()
         to_del = []
         for idx, g in self.glow.items():
             g2 = g * dec
@@ -300,9 +408,11 @@ class Scene:
                 to_del.append(idx)
                 continue
             self.glow[idx] = g2
+            row, col = divmod(idx, self.W)
+            if self.panel_rect and self._in_panel(row, col):
+                continue  # keep simulating, but don't draw under an open panel
             be = clamp(g2 * env * gbright)
             ch = glyph_for(be)
-            row, col = divmod(idx, self.W)
             if ch == " ":
                 if idx in self.disp:
                     out.append(move(row, col) + " ")
@@ -318,11 +428,101 @@ class Scene:
             self.hue.pop(idx, None)
             if idx in self.disp:
                 row, col = divmod(idx, self.W)
-                out.append(move(row, col) + " ")
+                if not (self.panel_rect and self._in_panel(row, col)):
+                    out.append(move(row, col) + " ")
                 del self.disp[idx]
 
-        if self.breath.enabled and self.args.indicator:
-            self._draw_indicator(env, blabel, warmth, out)
+        if self.overlay:
+            self._emit_panel(out)
+        else:
+            if self.breath.enabled and self.args.indicator:
+                self._draw_indicator(env, blabel, warmth, out)
+            self._draw_hint(t, out)
+
+    # ---- overlay rendering --------------------------------------------------
+
+    def _in_panel(self, row, col):
+        top, left, h, w = self.panel_rect
+        return top <= row < top + h and left <= col < left + w
+
+    def _prepare_panel(self):
+        if self.overlay == "help":
+            title = "driftlight — help"
+            entries = [
+                "h            toggle this help",
+                "s            open settings",
+                "q            quit",
+                "esc          close panel (or quit)",
+                "",
+                "in settings —",
+                "  j / k      move selection",
+                "  ← / →      change value  (or - / +)",
+                "  space      toggle / cycle",
+            ]
+            footer = "esc or h to close"
+            sel = None
+        else:
+            title = "driftlight — settings"
+            lw = max(len(f["label"]) for f in self.fields)
+            entries = [f"{f['label']:<{lw}}   {f['val']()}" for f in self.fields]
+            footer = "j/k move · ←/→ or -/+ change · esc close"
+            sel = self.sel
+        need = max([len(title) + 2, len(footer) + 2] + [len("▸ " + e) for e in entries])
+        w = min(need + 2, self.W)
+        h = min(len(entries) + 4, self.H)
+        top = max(0, (self.H - h) // 2)
+        left = max(0, (self.W - w) // 2)
+        self.panel_rect = (top, left, h, w)
+        self._panel_payload = (title, entries, footer, sel)
+
+    def _emit_panel(self, out):
+        top, left, h, w = self.panel_rect
+        title, entries, footer, sel = self._panel_payload
+        iw = w - 2                      # inner content width (inside the │ │)
+        base = self.emit_color(150, 175, 175)
+        hl = self.emit_color(240, 248, 248)
+        ti = self.emit_color(120, 205, 190)
+        ft = self.emit_color(110, 132, 132)
+        # top border with inset title
+        bar = list("─" * (w - 2))
+        for i, chh in enumerate(f" {title} "):
+            if 1 + i < len(bar):
+                bar[1 + i] = chh
+        out.append(move(top, left) + ti + "┌" + "".join(bar) + "┐")
+        r = top + 1
+        for i, e in enumerate(entries):
+            marker = "▸ " if (sel is not None and i == sel) else "  "
+            content = (marker + e)[:iw].ljust(iw)
+            colr = hl if (sel is not None and i == sel) else base
+            out.append(move(r, left) + base + "│" + colr + content + base + "│")
+            r += 1
+        out.append(move(r, left) + base + "├" + "─" * (w - 2) + "┤")
+        r += 1
+        fcontent = ("  " + footer)[:iw].ljust(iw)
+        out.append(move(r, left) + base + "│" + ft + fcontent + base + "│")
+        r += 1
+        out.append(move(r, left) + base + "└" + "─" * (w - 2) + "┘")
+
+    def _emit_clear(self, rect, out):
+        top, left, h, w = rect
+        blank = " " * w
+        for r in range(top, min(top + h, self.H)):
+            out.append(move(r, left) + blank)
+            for c in range(left, left + w):
+                self.disp.pop(r * self.W + c, None)
+
+    def _draw_hint(self, t, out):
+        # a soft, self-erasing discoverability hint for the first few seconds
+        txt = " h help · s settings · q quit "
+        col = max(0, (self.W - len(txt)) // 2)
+        row = self.H - 1
+        if t < 6.0:
+            out.append(move(row, col) + self.emit_color(70, 90, 90) + txt)
+        elif not self._hint_done:
+            self._hint_done = True
+            out.append(move(row, col) + " " * len(txt))
+            for c in range(col, col + len(txt)):
+                self.disp.pop(row * self.W + c, None)
 
     def _draw_indicator(self, env, label, warmth, out):
         dot = glyph_for(clamp(0.2 + env * 0.8))
@@ -344,11 +544,42 @@ class Scene:
 # main loop
 # ----------------------------------------------------------------------------
 
+_ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left"}
+
+
+def parse_keys(data):
+    """Turn a raw input chunk into a list of logical keys.
+
+    Handles CSI arrow sequences (ESC [ A/B/C/D), a lone ESC, Enter, Space,
+    and passes letters through lowercased.
+    """
+    keys = []
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i]
+        if c == "\x1b":
+            if data[i + 1:i + 2] == "[" and data[i + 2:i + 3] in _ARROWS:
+                keys.append(_ARROWS[data[i + 2]])
+                i += 3
+                continue
+            keys.append("esc")
+            i += 1
+            continue
+        if c in ("\r", "\n"):
+            keys.append("enter")
+        elif c == " ":
+            keys.append("space")
+        elif c.isalpha():
+            keys.append(c.lower())
+        else:
+            keys.append(c)
+        i += 1
+    return keys
+
+
 def run(args):
     scene = Scene(args)
     out_stream = sys.stdout
-    fps = args.fps
-    frame_time = 1.0 / fps
     resized = {"flag": False}
 
     def on_winch(signum, frame):
@@ -366,7 +597,6 @@ def run(args):
             import tty
             raw = (sys.stdin.fileno(), termios.tcgetattr(sys.stdin.fileno()))
             tty.setcbreak(sys.stdin.fileno())
-            os.set_blocking(sys.stdin.fileno(), False)
         except Exception:
             raw = None
 
@@ -390,8 +620,9 @@ def run(args):
                 if args.altscreen:
                     out_stream.write(CLEAR)
 
+            frame_time = 1.0 / scene.fps
             out = []
-            scene.render_frame(t, dt, fps, out)
+            scene.render_frame(t, dt, out)
             if out:
                 out_stream.write("".join(out))
                 out_stream.flush()
@@ -400,14 +631,20 @@ def run(args):
             if args.frames and frames >= args.frames:
                 break
 
-            # check for quit key
-            if raw is not None:
+            # poll for keys without making the tty non-blocking (which would
+            # also make stdout non-blocking on a shared fd and crash on flush)
+            quit_now = False
+            if raw is not None and select.select([sys.stdin], [], [], 0)[0]:
                 try:
-                    ch = sys.stdin.read(1)
-                    if ch and ch in ("q", "Q", "\x1b"):
-                        break
+                    data = os.read(raw[0], 64).decode("utf-8", "ignore")
                 except Exception:
-                    pass
+                    data = ""
+                for key in parse_keys(data):
+                    if scene.handle_key(key) == "quit":
+                        quit_now = True
+                        break
+            if quit_now:
+                break
 
             sleep = frame_time - (time.monotonic() - now)
             if sleep > 0:
@@ -419,7 +656,6 @@ def run(args):
             try:
                 import termios
                 termios.tcsetattr(raw[0], termios.TCSADRAIN, raw[1])
-                os.set_blocking(raw[0], True)
             except Exception:
                 pass
         if args.altscreen:
