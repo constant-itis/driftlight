@@ -53,6 +53,8 @@ In the settings panel:
 
 Every setting below can be changed live from the `s` panel without restarting —
 handy for finding the density and palette that feel right for your terminal.
+Pick a palette as a starting point, then fine-tune with the **Hue**,
+**Saturation**, **Brightness**, and **Glow** sliders to land on your exact color.
 
 ## Why it's calm (and cmatrix isn't)
 
@@ -101,7 +103,11 @@ driftlight --sleep 30
 
 | flag | default | what it does |
 |------|---------|--------------|
-| `--palette NAME` | `teal` | `teal`, `ice`, `aurora`, `ember`, `mono`, `violet` |
+| `--palette NAME` | `teal` | starting color: `teal`, `ice`, `aurora`, `ember`, `mono`, `violet` |
+| `--hue DEG` | `0` | rotate the palette hue, -180..180° |
+| `--saturation N` | `1.0` | color saturation multiplier, 0..1.5 (lower = washed out) |
+| `--brightness N` | `1.0` | overall brightness gain, 0.3..1.8 |
+| `--glow N` | `0.5` | how long faint points linger, 0..1 |
 | `--density N` | `1.0` | how much plankton (0.2 sparse .. 2.0 dense) |
 | `--linger SEC` | `3.2` | seconds a flash takes to fade out |
 | `--fps N` | `22` | frames per second |

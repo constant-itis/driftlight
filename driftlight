@@ -22,6 +22,7 @@ Quit with Ctrl-C or 'q'.
 """
 
 import argparse
+import colorsys
 import math
 import os
 import random
@@ -87,6 +88,13 @@ PALETTES = {
 }
 
 AMBER = (255, 150, 60)           # circadian warm-shift target
+AMBER_HUE = colorsys.rgb_to_hsv(AMBER[0] / 255, AMBER[1] / 255, AMBER[2] / 255)[0]
+
+
+def lerp_hue(h, target, t):
+    """Interpolate a hue toward target along the shortest way around the wheel."""
+    d = ((target - h + 0.5) % 1.0) - 0.5
+    return (h + d * t) % 1.0
 
 # brightness -> glyph  (thresholds on *effective* brightness)
 GLYPHS = ((0.10, " "), (0.30, "·"), (0.55, "∙"),
@@ -186,6 +194,7 @@ class Scene:
     def __init__(self, args):
         self.args = args
         self.peak = PALETTES[args.palette]
+        self.base_hsv = colorsys.rgb_to_hsv(*(c / 255 for c in self.peak))
         self.hue_jitter = 0.45 if args.palette == "aurora" else 0.22
         self.glow = {}   # idx -> brightness float (0..1)
         self.hue = {}    # idx -> -1..1 per-particle hue offset
@@ -222,7 +231,20 @@ class Scene:
         def set_pal(d):
             self.args.palette = cyc(pals, self.args.palette, d)
             self.peak = PALETTES[self.args.palette]
+            self.base_hsv = colorsys.rgb_to_hsv(*(c / 255 for c in self.peak))
             self.hue_jitter = 0.45 if self.args.palette == "aurora" else 0.22
+
+        def set_hue(d):
+            self.args.hue = ((self.args.hue + d * 15 + 180) % 360) - 180
+
+        def set_sat(d):
+            self.args.saturation = round(clamp(self.args.saturation + d * 0.1, 0.0, 1.5), 1)
+
+        def set_bright(d):
+            self.args.brightness = round(clamp(self.args.brightness + d * 0.1, 0.3, 1.8), 1)
+
+        def set_glow(d):
+            self.args.glow = round(clamp(self.args.glow + d * 0.05, 0.0, 1.0), 2)
 
         def set_density(d):
             self.args.density = round(clamp(self.args.density + d * 0.1, 0.1, 3.0), 1)
@@ -246,6 +268,10 @@ class Scene:
         onoff = lambda b: "on" if b else "off"
         return [
             {"label": "Palette",   "val": lambda: self.args.palette,             "change": set_pal},
+            {"label": "Hue",       "val": lambda: f"{self.args.hue:+d}°",   "change": set_hue},
+            {"label": "Saturation","val": lambda: f"{self.args.saturation:.1f}", "change": set_sat},
+            {"label": "Brightness","val": lambda: f"{self.args.brightness:.1f}", "change": set_bright},
+            {"label": "Glow",      "val": lambda: f"{self.args.glow:.2f}",       "change": set_glow},
             {"label": "Density",   "val": lambda: f"{self.args.density:.1f}",    "change": set_density},
             {"label": "Linger",    "val": lambda: f"{self.args.linger:.1f}s",    "change": set_linger},
             {"label": "Breath",    "val": lambda: self.args.breath,              "change": set_breath},
@@ -366,18 +392,21 @@ class Scene:
         elif self.shimmer_dir < 0 and self.shimmer_pos < -span * 0.15:
             self.shimmer_active = False
 
-    def color_for(self, be, hue, warmth):
-        # warm-shift the palette after sunset
-        base = mix(self.peak, AMBER, warmth) if warmth > 0 else self.peak
-        r, g, b = base
-        # per-particle hue offset (greener / bluer)
-        g = clamp((g + hue * 26) / 255) * 255
-        b = clamp((b - hue * 20) / 255) * 255
-        # perceptual gamma so faint glows linger visibly
-        scale = be ** 0.62
-        r, g, b = int(r * scale), int(g * scale), int(b * scale)
+    def color_for(self, be, jitter, warmth):
+        h, s, v = self.base_hsv
+        # user hue rotation + subtle per-particle hue jitter
+        h = (h + self.args.hue / 360.0 + jitter * 0.08) % 1.0
+        s = clamp(s * self.args.saturation)
+        # circadian: pull hue toward amber and desaturate a touch after sunset
+        if warmth > 0:
+            h = lerp_hue(h, AMBER_HUE, warmth * 0.6)
+            s = clamp(s * (1.0 - 0.15 * warmth))
+        # brightness gain + glow gamma (lower gamma => faint points linger)
+        gamma = 0.9 - self.args.glow * 0.6
+        val = clamp(clamp(be * self.args.brightness) ** gamma * v)
+        r, g, b = colorsys.hsv_to_rgb(h, s, val)
         # quantize a touch to cut redraw churn
-        q = lambda v: (v // 6) * 6
+        q = lambda x: (int(x * 255) // 6) * 6
         return q(r), q(g), q(b)
 
     def render_frame(self, t, dt, out):
@@ -682,7 +711,15 @@ def build_parser():
 """,
     )
     p.add_argument("--palette", choices=sorted(PALETTES), default="teal",
-                   help="color mood (default: teal)")
+                   help="color mood / starting point (default: teal)")
+    p.add_argument("--hue", type=int, default=0, metavar="DEG",
+                   help="rotate the palette hue by DEG degrees, -180..180 (default 0)")
+    p.add_argument("--saturation", type=float, default=1.0,
+                   help="color saturation multiplier, 0..1.5 (default 1.0)")
+    p.add_argument("--brightness", type=float, default=1.0,
+                   help="overall brightness gain, 0.3..1.8 (default 1.0)")
+    p.add_argument("--glow", type=float, default=0.5,
+                   help="how long faint points linger, 0..1 (default 0.5)")
     p.add_argument("--density", type=float, default=1.0,
                    help="how much plankton (0.2 sparse .. 2.0 dense; default 1.0)")
     p.add_argument("--linger", type=float, default=3.2,
