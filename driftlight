@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+driftlight — a calming terminal screensaver.
+
+Plankton Wake: your terminal becomes the sea at night. Invisible currents
+drift through the dark and, where they pass, bioluminescent points flare
+cyan-green and slowly fade. Occasionally a shimmer sweeps across the water.
+
+Unlike cmatrix (fast, tense, high-contrast), driftlight is slow, sparse, and
+low-luminance — built to be watched, or half-watched, while you breathe.
+
+Premium touches, all optional:
+  - breath-sync   : the whole scene brightens on the inhale, dims on the exhale
+  - circadian     : after sunset the palette warms and dims (respects melatonin)
+  - long-arc weather: a hidden meta-state so it never loops into monotony
+  - --sleep       : a slow wind-down to near-stillness over N minutes
+
+Pure Python 3 stdlib. No dependencies. MIT licensed.
+
+Quit with Ctrl-C or 'q'.
+"""
+
+import argparse
+import math
+import os
+import random
+import shutil
+import signal
+import sys
+import time
+from datetime import datetime
+
+# ----------------------------------------------------------------------------
+# terminal control
+# ----------------------------------------------------------------------------
+
+ESC = "\033"
+ENTER_ALT = ESC + "[?1049h"
+LEAVE_ALT = ESC + "[?1049l"
+HIDE_CUR = ESC + "[?25l"
+SHOW_CUR = ESC + "[?25h"
+CLEAR = ESC + "[2J"
+RESET = ESC + "[0m"
+
+
+def move(row, col):
+    # 1-based
+    return f"{ESC}[{row + 1};{col + 1}H"
+
+
+def truecolor(r, g, b):
+    return f"{ESC}[38;2;{r};{g};{b}m"
+
+
+def color256(r, g, b):
+    # map 24-bit -> xterm-256 6x6x6 cube (216) + grayscale ramp
+    if abs(r - g) < 12 and abs(g - b) < 12 and abs(r - b) < 12:
+        # grayscale
+        gray = (r + g + b) // 3
+        if gray < 8:
+            idx = 16
+        elif gray > 248:
+            idx = 231
+        else:
+            idx = 232 + round((gray - 8) / 247 * 23)
+    else:
+        def c(v):
+            return 0 if v < 48 else (1 + (v - 35) // 40 if v < 115 else (v - 35) // 40)
+        idx = 16 + 36 * c(r) + 6 * c(g) + c(b)
+        idx = max(16, min(255, idx))
+    return f"{ESC}[38;5;{idx}m"
+
+
+# ----------------------------------------------------------------------------
+# palettes  (peak RGB at full brightness)
+# ----------------------------------------------------------------------------
+
+PALETTES = {
+    "teal":   (120, 255, 225),   # classic bioluminescent cyan-green
+    "ice":    (150, 220, 255),   # cold blue
+    "aurora": (150, 255, 180),   # green with wide hue jitter
+    "ember":  (255, 165, 80),    # warm firefly variant
+    "mono":   (210, 235, 235),   # near-white, ultra-minimal
+    "violet": (200, 160, 255),   # deep-sea purple
+}
+
+AMBER = (255, 150, 60)           # circadian warm-shift target
+
+# brightness -> glyph  (thresholds on *effective* brightness)
+GLYPHS = ((0.10, " "), (0.30, "·"), (0.55, "∙"),
+          (0.80, "•"), (1.01, "●"))
+
+
+def glyph_for(be):
+    for thr, ch in GLYPHS:
+        if be < thr:
+            return ch
+    return "●"
+
+
+def mix(a, b, t):
+    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def clamp(v, lo=0.0, hi=1.0):
+    return lo if v < lo else hi if v > hi else v
+
+
+# ----------------------------------------------------------------------------
+# breath envelope
+# ----------------------------------------------------------------------------
+
+class Breath:
+    """Turns a breathing pattern like '4-7-8' into a per-frame envelope.
+
+    env in [floor, 1]: multiplies scene brightness.
+    spawn: multiplies ignition rate (blooms on the inhale).
+    label: 'inhale' / 'hold' / 'exhale' — for the optional indicator.
+    """
+
+    FLOOR = 0.5
+
+    def __init__(self, spec):
+        self.enabled = spec not in (None, "off", "none")
+        self.phases = []  # (label, duration, env_from, env_to, spawn)
+        if not self.enabled:
+            self.period = 1.0
+            return
+        parts = [float(x) for x in spec.split("-")]
+        f = self.FLOOR
+        if len(parts) == 3:
+            inh, hold, exh = parts
+            self.phases = [
+                ("inhale", inh, f, 1.0, 1.6),
+                ("hold",   hold, 1.0, 1.0, 1.0),
+                ("exhale", exh, 1.0, f, 0.6),
+            ]
+        elif len(parts) == 4:
+            inh, h1, exh, h2 = parts
+            self.phases = [
+                ("inhale", inh, f, 1.0, 1.6),
+                ("hold",   h1, 1.0, 1.0, 1.0),
+                ("exhale", exh, 1.0, f, 0.6),
+                ("hold",   h2, f, f, 0.5),
+            ]
+        else:
+            raise ValueError("breath spec must be a-b-c or a-b-c-d, e.g. 4-7-8")
+        self.period = sum(p[1] for p in self.phases)
+
+    def at(self, t):
+        if not self.enabled:
+            return 1.0, 1.0, ""
+        tt = t % self.period
+        for label, dur, e0, e1, spawn in self.phases:
+            if tt < dur:
+                # ease with a smooth cosine for a natural breath curve
+                p = tt / dur if dur else 0.0
+                s = 0.5 - 0.5 * math.cos(math.pi * p)
+                return e0 + (e1 - e0) * s, spawn, label
+            tt -= dur
+        return 1.0, 1.0, ""
+
+
+# ----------------------------------------------------------------------------
+# circadian tint  (warmer + dimmer after sunset)
+# ----------------------------------------------------------------------------
+
+def circadian(now, enabled):
+    if not enabled:
+        return 1.0, 0.0  # dim=1, warmth=0
+    hour = now.hour + now.minute / 60.0
+    # sun peaks at 14:00, trough at 02:00
+    sun = math.cos((hour - 14.0) / 24.0 * 2 * math.pi) * 0.5 + 0.5
+    dim = 0.55 + 0.45 * sun       # night ~0.55, day 1.0
+    warmth = (1.0 - sun) * 0.55   # night warmer
+    return dim, warmth
+
+
+# ----------------------------------------------------------------------------
+# the scene
+# ----------------------------------------------------------------------------
+
+class Scene:
+    def __init__(self, args):
+        self.args = args
+        self.peak = PALETTES[args.palette]
+        self.hue_jitter = 0.45 if args.palette == "aurora" else 0.22
+        self.glow = {}   # idx -> brightness float (0..1)
+        self.hue = {}    # idx -> -1..1 per-particle hue offset
+        self.disp = {}   # idx -> (glyph, colorkey) currently on screen
+        self.emit_color = truecolor if args.truecolor else color256
+        self.breath = Breath(args.breath)
+        self.rng = random.Random(args.seed) if args.seed is not None else random
+        # decay tuned so a flash lingers ~`linger` seconds down to eps
+        self.eps = 0.06
+        self.set_size()
+        # shimmer sweep state
+        self.shimmer_active = False
+        self.shimmer_pos = 0.0
+        self.shimmer_dir = 1
+        self.next_shimmer = 6.0
+
+    def set_size(self):
+        sz = shutil.get_terminal_size((80, 24))
+        self.W, self.H = sz.columns, max(1, sz.lines)
+        self.glow.clear()
+        self.hue.clear()
+        self.disp.clear()
+
+    # per-frame decay factor from fps + linger seconds
+    def decay(self, fps):
+        frames = max(1.0, self.args.linger * fps)
+        return self.eps ** (1.0 / frames)
+
+    def field(self, x, y, t):
+        """Smooth, slowly-drifting 'current' in [0,1]. High -> plankton wake."""
+        nx = x / max(1, self.W)
+        ny = y / max(1, self.H)
+        a = 0.5 + 0.5 * math.sin(2 * math.pi * (nx * 1.3 + ny * 0.7) + t * 0.18)
+        b = 0.5 + 0.5 * math.sin(2 * math.pi * (nx * 0.6 - ny * 1.1) - t * 0.11)
+        c = 0.5 + 0.5 * math.sin(2 * math.pi * (nx * 2.1 + ny * 1.7) + t * 0.07)
+        return (a * 0.55 + b * 0.30 + c * 0.15)
+
+    def ignite(self, idx, peak):
+        cur = self.glow.get(idx, 0.0)
+        if peak > cur:
+            self.glow[idx] = peak
+            self.hue[idx] = self.rng.uniform(-1, 1) * self.hue_jitter
+
+    def spawn(self, t, spawn_mult, weather, sleepf):
+        density = self.args.density * spawn_mult * weather * sleepf
+        attempts = int(self.W * self.H * 0.0045 * density)
+        thr = 0.62
+        for _ in range(attempts):
+            x = self.rng.randrange(self.W)
+            y = self.rng.randrange(self.H)
+            f = self.field(x, y, t)
+            if f > thr and self.rng.random() < (f - thr) * 3.2:
+                self.ignite(y * self.W + x, self.rng.uniform(0.85, 1.0))
+
+    def update_shimmer(self, t, dt):
+        if not self.args.shimmer:
+            return
+        if not self.shimmer_active:
+            self.next_shimmer -= dt
+            if self.next_shimmer <= 0:
+                self.shimmer_active = True
+                self.shimmer_dir = self.rng.choice((-1, 1))
+                span = self.W + self.H
+                self.shimmer_pos = -span * 0.15 if self.shimmer_dir > 0 else span * 1.15
+                self.next_shimmer = self.rng.uniform(22, 55)
+            return
+        span = self.W + self.H
+        self.shimmer_pos += self.shimmer_dir * span * 0.012
+        # light plankton along a soft diagonal band
+        band = 3.5
+        tries = int(self.W * 0.5)
+        for _ in range(tries):
+            x = self.rng.randrange(self.W)
+            # y so that x+y ~ shimmer_pos
+            y = int(round(self.shimmer_pos - x)) + self.rng.randint(-3, 3)
+            if 0 <= y < self.H:
+                d = abs((x + y) - self.shimmer_pos)
+                if d < band and self.rng.random() < 0.5:
+                    self.ignite(y * self.W + x, self.rng.uniform(0.4, 0.75))
+        if self.shimmer_dir > 0 and self.shimmer_pos > span * 1.15:
+            self.shimmer_active = False
+        elif self.shimmer_dir < 0 and self.shimmer_pos < -span * 0.15:
+            self.shimmer_active = False
+
+    def color_for(self, be, hue, warmth):
+        # warm-shift the palette after sunset
+        base = mix(self.peak, AMBER, warmth) if warmth > 0 else self.peak
+        r, g, b = base
+        # per-particle hue offset (greener / bluer)
+        g = clamp((g + hue * 26) / 255) * 255
+        b = clamp((b - hue * 20) / 255) * 255
+        # perceptual gamma so faint glows linger visibly
+        scale = be ** 0.62
+        r, g, b = int(r * scale), int(g * scale), int(b * scale)
+        # quantize a touch to cut redraw churn
+        q = lambda v: (v // 6) * 6
+        return q(r), q(g), q(b)
+
+    def render_frame(self, t, dt, fps, out):
+        env, spawn_mult, blabel = self.breath.at(t)
+        dim, warmth = circadian(datetime.now(), self.args.circadian)
+        sleepf = self._sleep_factor(t)
+        gbright = dim * (0.3 + 0.7 * sleepf)  # sleep dims too, never fully 0 mid-run
+
+        self.update_shimmer(t, dt)
+        self.spawn(t, spawn_mult, 0.9 + 0.5 * math.sin(t / (self.args.weather * 60.0)) if self.args.weather else 1.0, sleepf)
+
+        dec = self.decay(fps)
+        to_del = []
+        for idx, g in self.glow.items():
+            g2 = g * dec
+            if g2 < self.eps:
+                to_del.append(idx)
+                continue
+            self.glow[idx] = g2
+            be = clamp(g2 * env * gbright)
+            ch = glyph_for(be)
+            row, col = divmod(idx, self.W)
+            if ch == " ":
+                if idx in self.disp:
+                    out.append(move(row, col) + " ")
+                    del self.disp[idx]
+                continue
+            col_rgb = self.color_for(be, self.hue.get(idx, 0.0), warmth)
+            key = (ch, col_rgb)
+            if self.disp.get(idx) != key:
+                out.append(move(row, col) + self.emit_color(*col_rgb) + ch)
+                self.disp[idx] = key
+        for idx in to_del:
+            self.glow.pop(idx, None)
+            self.hue.pop(idx, None)
+            if idx in self.disp:
+                row, col = divmod(idx, self.W)
+                out.append(move(row, col) + " ")
+                del self.disp[idx]
+
+        if self.breath.enabled and self.args.indicator:
+            self._draw_indicator(env, blabel, warmth, out)
+
+    def _draw_indicator(self, env, label, warmth, out):
+        dot = glyph_for(clamp(0.2 + env * 0.8))
+        base = mix((90, 120, 120), AMBER, warmth)
+        r, g, b = (int(c * (0.35 + 0.65 * env)) for c in base)
+        text = f"{label:<7}{dot}"
+        row = self.H - 1
+        col = max(0, self.W - len(text) - 1)
+        out.append(move(row, col) + self.emit_color(r, g, b) + text)
+
+    def _sleep_factor(self, t):
+        if not self.args.sleep:
+            return 1.0
+        total = self.args.sleep * 60.0
+        return clamp(1.0 - t / total, 0.03, 1.0)
+
+
+# ----------------------------------------------------------------------------
+# main loop
+# ----------------------------------------------------------------------------
+
+def run(args):
+    scene = Scene(args)
+    out_stream = sys.stdout
+    fps = args.fps
+    frame_time = 1.0 / fps
+    resized = {"flag": False}
+
+    def on_winch(signum, frame):
+        resized["flag"] = True
+
+    have_winch = hasattr(signal, "SIGWINCH")
+    if have_winch:
+        signal.signal(signal.SIGWINCH, on_winch)
+
+    # optional 'q' to quit (only on a real tty)
+    raw = None
+    if args.altscreen and sys.stdin.isatty():
+        try:
+            import termios
+            import tty
+            raw = (sys.stdin.fileno(), termios.tcgetattr(sys.stdin.fileno()))
+            tty.setcbreak(sys.stdin.fileno())
+            os.set_blocking(sys.stdin.fileno(), False)
+        except Exception:
+            raw = None
+
+    if args.altscreen:
+        out_stream.write(ENTER_ALT + HIDE_CUR + CLEAR)
+        out_stream.flush()
+
+    start = time.monotonic()
+    last = start
+    frames = 0
+    try:
+        while True:
+            now = time.monotonic()
+            t = now - start
+            dt = now - last
+            last = now
+
+            if resized["flag"]:
+                resized["flag"] = False
+                scene.set_size()
+                if args.altscreen:
+                    out_stream.write(CLEAR)
+
+            out = []
+            scene.render_frame(t, dt, fps, out)
+            if out:
+                out_stream.write("".join(out))
+                out_stream.flush()
+
+            frames += 1
+            if args.frames and frames >= args.frames:
+                break
+
+            # check for quit key
+            if raw is not None:
+                try:
+                    ch = sys.stdin.read(1)
+                    if ch and ch in ("q", "Q", "\x1b"):
+                        break
+                except Exception:
+                    pass
+
+            sleep = frame_time - (time.monotonic() - now)
+            if sleep > 0:
+                time.sleep(sleep)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if raw is not None:
+            try:
+                import termios
+                termios.tcsetattr(raw[0], termios.TCSADRAIN, raw[1])
+                os.set_blocking(raw[0], True)
+            except Exception:
+                pass
+        if args.altscreen:
+            out_stream.write(RESET + SHOW_CUR + LEAVE_ALT)
+            out_stream.flush()
+
+
+def detect_truecolor():
+    ct = os.environ.get("COLORTERM", "").lower()
+    return "truecolor" in ct or "24bit" in ct
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="driftlight",
+        description="A calming bioluminescent terminal screensaver. Quit with Ctrl-C or 'q'.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  driftlight                         # gentle defaults
+  driftlight --breath 4-7-8          # sync your breathing to the sea
+  driftlight --palette violet --density 0.6
+  driftlight --sleep 30              # wind down to stillness over 30 min
+  driftlight --breath box            # 4-4-4-4 box breathing
+""",
+    )
+    p.add_argument("--palette", choices=sorted(PALETTES), default="teal",
+                   help="color mood (default: teal)")
+    p.add_argument("--density", type=float, default=1.0,
+                   help="how much plankton (0.2 sparse .. 2.0 dense; default 1.0)")
+    p.add_argument("--linger", type=float, default=3.2,
+                   help="seconds a flash takes to fade (default 3.2)")
+    p.add_argument("--fps", type=int, default=22, help="frames per second (default 22)")
+    p.add_argument("--breath", default="off", metavar="SPEC",
+                   help="breath-sync: 'off', '4-7-8', 'box', or 'a-b-c' / 'a-b-c-d'")
+    p.add_argument("--no-circadian", dest="circadian", action="store_false",
+                   help="disable warm+dim palette drift after sunset")
+    p.add_argument("--no-shimmer", dest="shimmer", action="store_false",
+                   help="disable the occasional diagonal shimmer sweep")
+    p.add_argument("--no-indicator", dest="indicator", action="store_false",
+                   help="hide the breath indicator in the corner")
+    p.add_argument("--weather", type=float, default=8.0, metavar="MIN",
+                   help="long-arc bloom/calm cycle length in minutes (0 = off; default 8)")
+    p.add_argument("--sleep", type=float, default=0.0, metavar="MIN",
+                   help="wind down to near-stillness over MIN minutes (default: off)")
+    p.add_argument("--seed", type=int, default=None, help="reproducible randomness")
+    p.add_argument("--256", dest="truecolor", action="store_false",
+                   help="force 256-color mode (default: auto-detect truecolor)")
+    p.add_argument("--truecolor", dest="truecolor", action="store_true",
+                   help="force 24-bit truecolor")
+    p.add_argument("--frames", type=int, default=0,
+                   help="render N frames then exit (for testing; 0 = run forever)")
+    p.add_argument("--no-altscreen", dest="altscreen", action="store_false",
+                   help="don't use the alternate screen buffer (for testing)")
+    p.set_defaults(truecolor=detect_truecolor(), circadian=True, shimmer=True,
+                   indicator=True, altscreen=True)
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.breath == "box":
+        args.breath = "4-4-4-4"
+    if args.breath in ("off", "none"):
+        args.breath = "off"
+    try:
+        run(args)
+    except ValueError as e:
+        sys.stderr.write(f"driftlight: {e}\n")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
