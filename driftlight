@@ -199,6 +199,8 @@ class Scene:
         self.glow = {}   # idx -> brightness float (0..1)
         self.hue = {}    # idx -> -1..1 per-particle hue offset
         self.disp = {}   # idx -> (glyph, colorkey) currently on screen
+        self.style_disp = {}  # idx -> (glyph, colorkey) for non-grid styles
+        self.core_particles = []
         self.emit_color = truecolor if args.truecolor else color256
         self.breath = Breath(args.breath)
         self.rng = random.Random(args.seed) if args.seed is not None else random
@@ -262,11 +264,18 @@ class Scene:
         def set_weather(d):
             self.args.weather = round(clamp(self.args.weather + d, 0, 30))
 
+        def set_style(d):
+            styles = ["plankton", "breathcore"]
+            self.args.style = styles[(styles.index(self.args.style) + d) % len(styles)]
+            self.style_disp.clear()
+            self.core_particles.clear()
+
         def toggle(attr):
             return lambda d: setattr(self.args, attr, not getattr(self.args, attr))
 
         onoff = lambda b: "on" if b else "off"
         return [
+            {"label": "Style",     "val": lambda: self.args.style,             "change": set_style},
             {"label": "Palette",   "val": lambda: self.args.palette,             "change": set_pal},
             {"label": "Hue",       "val": lambda: f"{self.args.hue:+d}°",   "change": set_hue},
             {"label": "Saturation","val": lambda: f"{self.args.saturation:.1f}", "change": set_sat},
@@ -330,6 +339,213 @@ class Scene:
         self.glow.clear()
         self.hue.clear()
         self.disp.clear()
+        self.style_disp.clear()
+        self.core_particles.clear()
+
+    def _core_radius(self, t):
+        """Breathing radius in terminal-cell units; y is corrected for cell aspect."""
+        env, _, label = self.breath.at(t)
+        if self.breath.enabled:
+            phase = (env - Breath.FLOOR) / (1.0 - Breath.FLOOR)
+        else:
+            phase = 0.5 + 0.5 * math.sin(t * 0.34)
+        span = min(self.W * 0.32, self.H * 0.70)
+        return max(2.0, span * (0.40 + 0.60 * phase)), label, phase
+
+    def _core_cell(self, x, y):
+        return y * self.W + x
+
+    def _core_add(self, frame, x, y, ch, be, warmth):
+        if not (0 <= x < self.W and 0 <= y < self.H):
+            return
+        if self.panel_rect and self._in_panel(y, x):
+            return
+        # Keep each cell's hue stable between frames; randomizing here would
+        # make a calm ring shimmer like noise instead of breathing.
+        jitter = (((x * 92821 + y * 68917) % 1000) / 500.0 - 1.0) * 0.35
+        rgb = self.color_for(clamp(be), jitter, warmth)
+        frame[self._core_cell(x, y)] = (ch, rgb)
+
+    def _render_breathcore(self, t, dt, env, warmth, sleepf, out):
+        """A slow breathing tide: a luminous core gathers and releases plankton."""
+        cx, cy = (self.W - 1) / 2.0, (self.H - 1) / 2.0
+        radius, blabel, phase = self._core_radius(t)
+        # Spawn at the outside edge. During inhale they are drawn inward;
+        # during exhale they are carried back out, like a tide reversing.
+        rate = self.args.density * (0.35 + 1.25 * phase) * sleepf
+        for _ in range(max(0, int(self.W * self.H * 0.0018 * rate))):
+            a = self.rng.random() * math.tau
+            outer = max(self.W, self.H) * self.rng.uniform(0.28, 0.62)
+            x = cx + math.cos(a) * outer
+            y = cy + math.sin(a) * outer / 2.0
+            # Initial tangential velocity makes the field feel like water,
+            # rather than dots being teleported along a radial animation.
+            tangent = self.rng.uniform(1.2, 3.4)
+            self.core_particles.append({
+                "x": x, "y": y,
+                "vx": -math.sin(a) * tangent,
+                "vy": math.cos(a) * tangent / 2.0,
+                "mass": self.rng.uniform(0.75, 1.25),
+                "life": self.rng.uniform(15.0, 28.0),
+                "age": 0.0, "phase": self.rng.random() * math.tau,
+                "captured": False,
+                "capture_r": self.rng.uniform(0.10, 0.82),
+                "capture_a": self.rng.random() * math.tau,
+                "trail": [],
+            })
+
+        next_particles = []
+        for p in self.core_particles:
+            p["age"] += dt
+            # A tiny fluid-like integrator: neutral breeze in the air, then a
+            # pressure event only while the core is changing size. Growing
+            # inhale = suction; shrinking exhale = expulsion. Holds leave the
+            # motes in the air, carried by the breeze rather than pulled in.
+            if blabel == "inhale":
+                pressure_mode = -1.0
+            elif blabel == "exhale":
+                pressure_mode = 1.0
+            elif blabel == "hold":
+                pressure_mode = 0.0
+            else:
+                # Free-running mode uses the derivative of the slow breath,
+                # not its absolute size: only expansion/contraction creates a
+                # pressure change.
+                pressure_mode = -1.0 if math.cos(t * 0.34) > 0 else 1.0
+            dx = p["x"] - cx
+            dy = (p["y"] - cy) * 2.0
+            distance = math.hypot(dx, dy)
+            near_core = clamp(1.0 - distance / max(radius * 2.2, 1.0))
+            inv = 1.0 / max(distance, 0.001)
+            ux, uy = dx * inv, dy * inv
+            pressure = pressure_mode
+            # Pressure is quiet in the open water and concentrates near the
+            # ring. Exhale gets a transient pressure pulse, like a wake.
+            pressure_force = pressure * (1.8 + near_core * 11.0)
+            if pressure_mode > 0 and p["age"] < 2.2:
+                pressure_force += (2.2 - p["age"]) * 1.8
+
+            # Inhale captures a random fraction of the incoming motes. Once
+            # captured, they populate the interior as a living cloud instead
+            # of immediately crossing the center. Exhale releases them one by
+            # one, so the cloud breathes out like smoke rather than exploding.
+            if not p["captured"] and pressure_mode < 0 and distance < radius * 1.65:
+                p["captured"] = True
+                p["capture_r"] = self.rng.uniform(0.08, 0.84)
+                p["capture_a"] = math.atan2(dy, dx) + self.rng.uniform(-0.7, 0.7)
+                p["vx"] *= 0.18
+                p["vy"] *= 0.18
+            if p["captured"] and pressure_mode > 0:
+                release_chance = min(1.0, dt * (0.10 + 0.28 * self.rng.random()))
+                if self.rng.random() < release_chance:
+                    p["captured"] = False
+                    # Random smoke exit: mostly outward, with a cross-breeze
+                    # and a little variation so no two exhales match.
+                    exit_a = p["capture_a"] + self.rng.uniform(-0.85, 0.85)
+                    kick = self.rng.uniform(2.8, 6.8)
+                    p["vx"] = math.cos(exit_a) * kick + self.rng.uniform(-1.2, 1.2)
+                    p["vy"] = math.sin(exit_a) * kick / 2.0 + self.rng.uniform(-0.6, 0.6)
+
+            # A broad, slowly changing cross-current makes the particles feel
+            # like motes in air before the breath catches them. Close to the
+            # core, the current curls into a vortex; far away it is just wind.
+            breeze_x = math.sin(t * 0.11 + dy * 0.035) * 0.34
+            breeze_y = math.cos(t * 0.09 + dx * 0.028) * 0.22
+            swirl = near_core * (1.4 + near_core * 4.0)
+            shear = math.sin(t * 0.17 + p["phase"] + dx * 0.06) * (0.25 + near_core * 0.55)
+            if p["captured"]:
+                # Soft spring toward a moving interior address. The address
+                # follows the ring size, so the cloud fills and contracts with
+                # the breath instead of looking pasted onto the center.
+                p["capture_a"] += (0.10 + near_core * 0.28) * dt
+                target_r = radius * p["capture_r"]
+                tx = cx + math.cos(p["capture_a"]) * target_r
+                ty = cy + math.sin(p["capture_a"]) * target_r / 2.0
+                ax = (tx - p["x"]) * 2.8 + breeze_x * 0.45
+                ay = (ty - p["y"]) * 2.8 + breeze_y * 0.45
+            else:
+                ax = pressure_force * ux + breeze_x - (swirl + shear) * uy
+                ay = pressure_force * uy + breeze_y + (swirl + shear) * ux
+            p["vx"] += ax * dt / p["mass"]
+            p["vy"] += ay * dt / p["mass"] / 2.0
+            drag = max(0.0, 1.0 - dt * (0.42 + near_core * 0.8))
+            p["vx"] *= drag
+            p["vy"] *= drag
+            speed = math.hypot(p["vx"], p["vy"])
+            if speed > 9.0:
+                scale = 9.0 / speed
+                p["vx"] *= scale
+                p["vy"] *= scale
+            old_x, old_y = p["x"], p["y"]
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            # Keep a tiny tail so the motion is perceptible at terminal FPS.
+            p["trail"].append((old_x, old_y))
+            if len(p["trail"]) > 3:
+                p["trail"].pop(0)
+            new_distance = math.hypot(p["x"] - cx, (p["y"] - cy) * 2.0)
+            if p["age"] < p["life"] and (p["captured"] or 1.5 < new_distance < max(self.W, self.H) * 0.75):
+                next_particles.append(p)
+        # Never evict the dense reservoir just because the ambient field is
+        # busy. Cap free-air motes first; captured motes are the visual payoff.
+        held = [p for p in next_particles if p["captured"]]
+        free = [p for p in next_particles if not p["captured"]]
+        self.core_particles = held + free[-max(0, 900 - len(held)):]
+
+        frame = {}
+        # Soft aura and two uneven rings give the core a natural, not-perfectly-
+        # geometric edge. Terminal cells are taller than they are wide.
+        max_r = radius + 5.5
+        for y in range(max(0, int(cy - max_r / 2.0 - 2)), min(self.H, int(cy + max_r / 2.0 + 3))):
+            for x in range(max(0, int(cx - max_r - 2)), min(self.W, int(cx + max_r + 3))):
+                d = math.hypot(x - cx, (y - cy) * 2.0)
+                ring = math.exp(-((d - radius) / 2.2) ** 2)
+                aura = math.exp(-((d - radius * 0.58) / max(2.5, radius * 0.28)) ** 2) * 0.22
+                be = (ring * 0.95 + aura) * (0.42 + 0.58 * env) * sleepf
+                if be > 0.10:
+                    ch = glyph_for(be)
+                    self._core_add(frame, x, y, ch, be, warmth)
+        self._core_add(frame, int(round(cx)), int(round(cy)), "●", (0.8 + 0.2 * env) * sleepf, warmth)
+
+        for p in self.core_particles:
+            x = int(round(p["x"]))
+            y = int(round(p["y"]))
+            fade = min(1.0, p["age"] / 1.2, max(0.0, (p["life"] - p["age"]) / 2.0))
+            density_boost = 1.55 if p["captured"] else 1.0
+            be = (0.18 + 0.72 * fade) * density_boost * (0.55 + 0.45 * env) * sleepf
+            if p["captured"]:
+                # Captured motes are the focal event: keep them legible inside
+                # the ring instead of letting the low-luminance field swallow
+                # them. A minority brighten to a bead-like sparkle.
+                be = max(be, 0.42)
+            # Draw the tail first; later particle/core writes naturally win at
+            # overlaps, keeping the focal ring visually coherent.
+            for n, (txf, tyf) in enumerate(p["trail"]):
+                tx = int(round(txf))
+                ty = int(round(tyf))
+                self._core_add(frame, tx, ty, "·", be * (0.16 + 0.12 * n), warmth)
+            if be > 0.10:
+                if p["captured"]:
+                    sparkle = (int(p["capture_a"] * 17) + int(p["age"] * 3)) % 5 == 0
+                    ch = "•" if sparkle else "∙"
+                else:
+                    ch = glyph_for(be)
+                self._core_add(frame, x, y, ch, be, warmth)
+
+        # Remove last frame's cells that are no longer occupied, then draw diffs.
+        for idx in set(self.style_disp) - set(frame):
+            row, col = divmod(idx, self.W)
+            if not (self.panel_rect and self._in_panel(row, col)):
+                out.append(move(row, col) + " ")
+        for idx, value in frame.items():
+            if self.style_disp.get(idx) != value:
+                row, col = divmod(idx, self.W)
+                ch, rgb = value
+                out.append(move(row, col) + self.emit_color(*rgb) + ch)
+        self.style_disp = frame
+        if self.breath.enabled and self.args.indicator:
+            self._draw_indicator(env, blabel, warmth, out)
+        self._draw_hint(t, out)
 
     # per-frame decay factor from fps + linger seconds
     def decay(self):
@@ -423,6 +639,10 @@ class Scene:
         dim, warmth = circadian(datetime.now(), self.args.circadian)
         sleepf = self._sleep_factor(t)
         gbright = dim * (0.3 + 0.7 * sleepf)  # sleep dims too, never fully 0 mid-run
+
+        if self.args.style == "breathcore":
+            self._render_breathcore(t, dt, env, warmth, sleepf, out)
+            return
 
         self.update_shimmer(t, dt)
         weather = (0.9 + 0.5 * math.sin(t / (self.args.weather * 60.0))
@@ -712,6 +932,8 @@ def build_parser():
     )
     p.add_argument("--palette", choices=sorted(PALETTES), default="teal",
                    help="color mood / starting point (default: teal)")
+    p.add_argument("--style", choices=("plankton", "breathcore"), default="plankton",
+                   help="scene style (default: plankton; breathcore is a breathing central tide)")
     p.add_argument("--hue", type=int, default=0, metavar="DEG",
                    help="rotate the palette hue by DEG degrees, -180..180 (default 0)")
     p.add_argument("--saturation", type=float, default=1.0,

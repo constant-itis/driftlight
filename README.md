@@ -49,6 +49,19 @@ handy for finding the density and palette that feel right for your terminal.
 Pick a palette as a starting point, then fine-tune with the **Hue**,
 **Saturation**, **Brightness**, and **Glow** sliders to land on your exact color.
 
+## Styles
+
+The original `plankton` style remains the default. `breathcore` turns the
+middle of the terminal into a slow luminous tide: the central ring expands on
+the inhale, contracts on the exhale, and small motes gather inward and release
+outward with the phase.
+
+```sh
+driftlight --style breathcore --breath 4-7-8 --palette teal
+```
+
+The style can also be changed live from the first row of the `s` settings panel.
+
 ## Why it's calm (and cmatrix isn't)
 
 `cmatrix` is fast, high-contrast, and reads as *urgent*. driftlight inverts all
@@ -96,6 +109,7 @@ driftlight --sleep 30
 
 | flag | default | what it does |
 |------|---------|--------------|
+| `--style NAME` | `plankton` | scene style: `plankton` or `breathcore` |
 | `--palette NAME` | `teal` | starting color: `teal`, `ice`, `aurora`, `ember`, `mono`, `violet` |
 | `--hue DEG` | `0` | rotate the palette hue, -180..180° |
 | `--saturation N` | `1.0` | color saturation multiplier, 0..1.5 (lower = washed out) |
