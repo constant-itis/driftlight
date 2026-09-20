@@ -2,10 +2,9 @@
 
 A calming terminal screensaver. Think `cmatrix`, but the opposite feeling.
 
-Your terminal becomes the sea at night. Invisible currents drift through the
-dark and, where they pass, bioluminescent points flare cyan-green and slowly
-fade. Occasionally a shimmer sweeps across the water. It's slow, sparse, and
-low-luminance — built to be watched, or half-watched, while you breathe.
+Turn your terminal into night water, a living contour map, silk currents, or
+a tiny orbital sculpture. Six scenes share the same idea: slow motion, soft
+light, room to look away. Built to be watched, or half-watched, while you breathe.
 
 ![driftlight in motion](assets/demo.gif)
 
@@ -32,35 +31,56 @@ driftlight is interactive while it runs:
 | key | action |
 |-----|--------|
 | `h` | toggle the help panel |
-| `s` | open the settings panel — change palette, density, breath, etc. **live** |
+| `s` | open the settings panel at any time — change palette, density, breath, etc. **live** |
 | `q` / `Ctrl-C` | quit |
 | `esc` | close an open panel (or quit if none is open) |
+| `space` | drop a pebble while watching `ripple` (in Settings, select/cycle) |
 
 In the settings panel:
 
 | key | action |
 |-----|--------|
-| `j` / `k` or `↑` / `↓` | move the selection |
+| `↑` / `↓` or `k` / `j` | choose a setting |
 | `←` / `→` or `-` / `+` | change the selected value |
-| `space` | toggle / cycle the selected value |
+| `Enter` or `space` | select / cycle the highlighted value |
+| `Esc` | leave the settings menu |
 
-Every setting below can be changed live from the `s` panel without restarting —
+The scene and appearance settings can be changed live from the `s` panel without restarting —
 handy for finding the density and palette that feel right for your terminal.
 Pick a palette as a starting point, then fine-tune with the **Hue**,
 **Saturation**, **Brightness**, and **Glow** sliders to land on your exact color.
 
 ## Styles
 
-The original `plankton` style remains the default. `breathcore` turns the
-middle of the terminal into a slow luminous tide: the central ring expands on
-the inhale, contracts on the exhale, and small motes gather inward and release
-outward with the phase.
+| style | feeling / motion |
+|-------|------------------|
+| `plankton` | Original night sea: sparse glowing motes wake in invisible currents. |
+| `breathcore` | A luminous central ring gathers and releases motes; breath-sync gives it an inhale and exhale. |
+| `contour` | An imaginary topographic map slowly changes elevation. Fine contour lines form islands and valleys. Artsy survey-instrument energy. |
+| `ribbons` | Long, softly lit silk filaments fold across the screen. A little aurora, a little underwater fabric. |
+| `orrery` | A suspended orbital sculpture: tilted paths, small satellites, faint wakes, a quiet central sun. |
+| `ripple` | Sparse, overlapping water rings appear and dissolve. Press **Space** to drop another pebble at a new spot. |
+
+Start with `s` → **Style** → `←` / `→` to preview each scene. The name and
+description update immediately; `Enter` also advances. `Esc` gets you back to
+the scene. Changes are for the current run; use flags for a repeatable favorite.
 
 ```sh
 driftlight --style breathcore --breath 4-7-8 --palette teal
+driftlight --style contour --palette ice --density 0.7
+driftlight --style ribbons --palette violet --breath box
+driftlight --style orrery --palette ember --density 0.6
+driftlight --style ripple --palette teal --linger 5
 ```
 
-The style can also be changed live from the first row of the `s` settings panel.
+**Density** means activity/detail: motes, contour spacing, ribbon count, orbit
+count, or automatic pebble frequency. **Linger** changes plankton fading and
+ripple lifetime; **Shimmer** is specific to plankton. All styles use palette,
+hue, saturation, brightness, glow, breath brightness, and circadian tint.
+Glow lifts faint marks; it does not blur the terminal. Weather varies plankton
+blooms and the four new scenes' light; breathcore follows its breath instead.
+Sleep dims every scene and gradually slows the four new scenes. No sound,
+mouse, networking, or extra packages are needed.
 
 ## Why it's calm (and cmatrix isn't)
 
@@ -75,9 +95,8 @@ Everything below is optional and composable.
 
 ### Breath-sync
 The entire scene brightens on the inhale, holds, and dims on the exhale — and
-plankton bloom faster on the inhale. Within a minute your breathing tends to
-sync to it without being told to. A faint indicator in the corner shows the
-current phase.
+plankton bloom faster on the inhale. Follow the rhythm if it feels comfortable,
+or leave breath-sync off and just watch. A faint indicator shows the phase.
 
 ```sh
 driftlight --breath 4-7-8      # relaxing 4-7-8 breathing
@@ -89,7 +108,8 @@ driftlight --breath 4-4-6-2    # custom inhale-hold-exhale-hold
 ### Circadian palette drift  (on by default)
 driftlight reads your system clock. After sunset the palette warms toward amber
 and dims ~15%; deep night gets darker still; morning cools back to cyan. It
-respects your melatonin. Turn it off with `--no-circadian`.
+uses a simple time-of-day color curve, not a sleep or medical measurement.
+Turn it off with `--no-circadian`.
 
 ### Long-arc weather  (on by default)
 A hidden meta-state on an ~8-minute cycle slowly modulates how much plankton
@@ -109,14 +129,14 @@ driftlight --sleep 30
 
 | flag | default | what it does |
 |------|---------|--------------|
-| `--style NAME` | `plankton` | scene style: `plankton` or `breathcore` |
+| `--style NAME` | `plankton` | `plankton`, `breathcore`, `contour`, `ribbons`, `orrery`, `ripple` |
 | `--palette NAME` | `teal` | starting color: `teal`, `ice`, `aurora`, `ember`, `mono`, `violet` |
 | `--hue DEG` | `0` | rotate the palette hue, -180..180° |
 | `--saturation N` | `1.0` | color saturation multiplier, 0..1.5 (lower = washed out) |
 | `--brightness N` | `1.0` | overall brightness gain, 0.3..1.8 |
-| `--glow N` | `0.5` | how long faint points linger, 0..1 |
-| `--density N` | `1.0` | how much plankton (0.2 sparse .. 2.0 dense) |
-| `--linger SEC` | `3.2` | seconds a flash takes to fade out |
+| `--glow N` | `0.5` | lift faint marks, 0..1 |
+| `--density N` | `1.0` | scene activity/detail (0.2 sparse .. 2.0 dense) |
+| `--linger SEC` | `3.2` | plankton fade time; also extends ripple lifetime |
 | `--fps N` | `22` | frames per second |
 | `--breath SPEC` | `off` | `off`, `4-7-8`, `box`, or `a-b-c` / `a-b-c-d` |
 | `--sleep MIN` | off | wind down to stillness over MIN minutes |
@@ -135,7 +155,21 @@ driftlight --palette violet --density 0.6    # sparse deep-sea purple
 driftlight --breath 4-7-8 --palette ice      # cold, meditative, breathing
 driftlight --palette ember --density 1.4     # warm firefly swarm
 driftlight --sleep 45 --breath box           # bedtime
+driftlight --style contour --palette mono --brightness 0.7  # quiet cartography
+driftlight --style ribbons --palette aurora --density 0.5  # a few silk currents
+driftlight --style orrery --palette ice --breath 5-5-5      # slow observatory
+driftlight --style ripple --palette violet --sleep 20      # pebble pond
 ```
+
+## Development checks
+
+```sh
+python3 -m unittest discover -s tests -v
+./driftlight --style ribbons --frames 2 --no-altscreen > /dev/null
+```
+
+The tests exercise all six styles, repeatable seeded rendering, live Settings
+switching, clearing closed panels, small terminal bounds, and pebble input.
 
 ## Requirements
 

@@ -88,6 +88,15 @@ PALETTES = {
 }
 
 AMBER = (255, 150, 60)           # circadian warm-shift target
+STYLES = ("plankton", "breathcore", "contour", "ribbons", "orrery", "ripple")
+STYLE_NOTES = {
+    "plankton": "Bioluminescent motes in invisible currents.",
+    "breathcore": "A breathing ring gathers and releases motes.",
+    "contour": "Living topography; slow islands of elevation.",
+    "ribbons": "Long silk currents fold through the dark.",
+    "orrery": "Quiet orbital paths with wandering satellites.",
+    "ripple": "Water rings; Space drops a gentle pebble.",
+}
 AMBER_HUE = colorsys.rgb_to_hsv(AMBER[0] / 255, AMBER[1] / 255, AMBER[2] / 255)[0]
 
 
@@ -201,6 +210,10 @@ class Scene:
         self.disp = {}   # idx -> (glyph, colorkey) currently on screen
         self.style_disp = {}  # idx -> (glyph, colorkey) for non-grid styles
         self.core_particles = []
+        self.ripples = []
+        self.ripple_wait = 0.0
+        self.pebble_pending = False
+        self.art_time = 0.0
         self.emit_color = truecolor if args.truecolor else color256
         self.breath = Breath(args.breath)
         self.rng = random.Random(args.seed) if args.seed is not None else random
@@ -218,8 +231,8 @@ class Scene:
         self.sel = 0                 # selected settings row
         self.panel_rect = None       # (top, left, h, w) of open overlay
         self._clear_rect = None      # region to blank after a panel closes
+        self._clear_scene = False    # full repaint after renderer/style changes
         self._panel_payload = None
-        self._hint_done = False
         self.breath_opts = ["off", "4-7-8", "4-4-4-4", "5-5-5", "6-3-9"]
         self.fields = self._build_fields()
 
@@ -265,10 +278,19 @@ class Scene:
             self.args.weather = round(clamp(self.args.weather + d, 0, 30))
 
         def set_style(d):
-            styles = ["plankton", "breathcore"]
-            self.args.style = styles[(styles.index(self.args.style) + d) % len(styles)]
+            self.args.style = STYLES[(STYLES.index(self.args.style) + d) % len(STYLES)]
+            # The renderers maintain different cell caches. Clear the
+            # terminal and both caches together so stale cells and panels do
+            # not survive a live style transition.
+            self._clear_scene = True
+            self.disp.clear()
             self.style_disp.clear()
+            self.glow.clear()
+            self.hue.clear()
             self.core_particles.clear()
+            self.ripples.clear()
+            self.ripple_wait = 0.0
+            self.pebble_pending = False
 
         def toggle(attr):
             return lambda d: setattr(self.args, attr, not getattr(self.args, attr))
@@ -304,22 +326,26 @@ class Scene:
         """Return 'quit' to stop; otherwise mutate overlay/settings state."""
         if key == "q":
             return "quit"
+        # Settings is a global destination, not a toggle: S always gets there
+        # from the scene or another panel and never unexpectedly closes it.
+        if key == "s":
+            if self.overlay != "settings":
+                self.set_overlay("settings")
+            return None
         if self.overlay is None:
             if key == "h":
                 self.set_overlay("help")
-            elif key == "s":
-                self.set_overlay("settings")
+            elif key == "space" and self.args.style == "ripple":
+                self.pebble_pending = True
             elif key == "esc":
                 return "quit"
             return None
         if self.overlay == "help":
             if key in ("esc", "h"):
                 self.set_overlay(None)
-            elif key == "s":
-                self.set_overlay("settings")
             return None
         # settings
-        if key in ("esc", "s"):
+        if key == "esc":
             self.set_overlay(None)
             return None
         n = len(self.fields)
@@ -329,7 +355,11 @@ class Scene:
             self.sel = (self.sel + 1) % n
         elif key in ("left", "-", "_", ","):
             self.fields[self.sel]["change"](-1)
-        elif key in ("right", "+", "=", ".", "space", "enter"):
+        elif key in ("right", "+", "=", "."):
+            self.fields[self.sel]["change"](+1)
+        elif key in ("space", "enter"):
+            # Boolean and enumerated rows select/cycle their next value;
+            # numeric rows step forward, matching the live-preview model.
             self.fields[self.sel]["change"](+1)
         return None
 
@@ -341,6 +371,8 @@ class Scene:
         self.disp.clear()
         self.style_disp.clear()
         self.core_particles.clear()
+        self.ripples.clear()
+        self.ripple_wait = 0.0
 
     def _core_radius(self, t):
         """Breathing radius in terminal-cell units; y is corrected for cell aspect."""
@@ -356,7 +388,7 @@ class Scene:
         return y * self.W + x
 
     def _core_add(self, frame, x, y, ch, be, warmth):
-        if not (0 <= x < self.W and 0 <= y < self.H):
+        if not (0 <= x < self.W and 0 <= y < self.H - 1):
             return
         if self.panel_rect and self._in_panel(y, x):
             return
@@ -532,7 +564,10 @@ class Scene:
                     ch = glyph_for(be)
                 self._core_add(frame, x, y, ch, be, warmth)
 
-        # Remove last frame's cells that are no longer occupied, then draw diffs.
+        self._emit_art_frame(frame, out)
+
+    def _emit_art_frame(self, frame, out):
+        """One diff renderer for every geometric scene; overlays paint last."""
         for idx in set(self.style_disp) - set(frame):
             row, col = divmod(idx, self.W)
             if not (self.panel_rect and self._in_panel(row, col)):
@@ -543,9 +578,149 @@ class Scene:
                 ch, rgb = value
                 out.append(move(row, col) + self.emit_color(*rgb) + ch)
         self.style_disp = frame
-        if self.breath.enabled and self.args.indicator:
-            self._draw_indicator(env, blabel, warmth, out)
-        self._draw_hint(t, out)
+
+    def _art_add(self, frame, x, y, ch, light, hue=0.0):
+        x, y = int(round(x)), int(round(y))
+        # Reserve the last row for controls. All art is foreground-only, so
+        # transparent terminals retain their wallpaper/background.
+        if not (0 <= x < self.W and 0 <= y < self.H - 1):
+            return
+        if self.panel_rect and self._in_panel(y, x):
+            return
+        light = clamp(light * self.art_light)
+        if light < 0.035:
+            return
+        rgb = self.color_for(light, hue, self.art_warmth)
+        idx = y * self.W + x
+        old = frame.get(idx)
+        if old is None or sum(rgb) >= sum(old[1]):
+            frame[idx] = (ch, rgb)
+
+    def _render_contour(self, frame, t, density):
+        """Level sets of a drifting height field: an imaginary tidal map."""
+        scale = max(10.0, min(self.W, self.H * 2.0))
+        bands = 3.0 + density * 1.8
+        for y in range(self.H - 1):
+            ny = (y - self.H * 0.5) * 2.0 / scale
+            for x in range(self.W):
+                nx = (x - self.W * 0.5) / scale
+                a = nx * 3.5 + 0.35 * math.sin(ny * 3.0 + t * 0.035)
+                b = ny * 3.8 + 0.45 * math.sin(nx * 2.8 - t * 0.027)
+                z = (math.sin(a + t * 0.025) + math.cos(b - t * 0.018)
+                     + 0.38 * math.sin(a * 0.7 - b * 0.8))
+                level = z * bands
+                edge = abs(level - round(level))
+                if edge > 0.11:
+                    continue
+                # Tangent glyphs hint at slope instead of a uniform dot grid.
+                dx = math.cos(a) * 3.5
+                dy = -math.sin(b) * 3.8
+                ch = "─" if abs(dx) < abs(dy) * 0.5 else (
+                    "│" if abs(dy) < abs(dx) * 0.5 else ("╱" if dx * dy > 0 else "╲"))
+                light = (0.18 + 0.20 * (1.0 - edge / 0.11))
+                if round(level) % 3 == 0:
+                    light *= 1.35
+                self._art_add(frame, x, y, ch, light, z * 0.025)
+
+    def _render_ribbons(self, frame, t, density):
+        """Several coherent silk filaments, each with a dim trailing fold."""
+        count = max(2, min(10, round(3 + density * 2)))
+        height = max(1, self.H - 3)
+        for strand in range(count):
+            phase = strand * 1.71
+            base = height * (strand + 1) / (count + 1)
+            for x in range(self.W):
+                u = x / max(1, self.W - 1)
+                wave = u * math.tau * 0.8 + t * 0.09 + phase
+                fold = u * math.tau * 1.7 - t * 0.055 + phase * 0.7
+                y = base + height * (0.12 * math.sin(wave) + 0.055 * math.sin(fold))
+                slope = 0.12 * math.cos(wave) + 0.115 * math.cos(fold)
+                ch = "─" if abs(slope) < 0.08 else ("╲" if slope > 0 else "╱")
+                envelope = 0.65 + 0.35 * math.sin(u * math.pi)
+                sheen = 0.5 + 0.5 * math.sin(u * 5.0 - t * 0.11 + phase)
+                light = (0.21 + 0.25 * sheen) * envelope
+                self._art_add(frame, x, y + 1, "·", light * 0.28, strand * 0.025)
+                self._art_add(frame, x, y, ch, light, strand * 0.025)
+
+    def _render_orrery(self, frame, t, density):
+        """A suspended kinetic sculpture: paths, satellites, and a quiet sun."""
+        cx, cy = (self.W - 1) * 0.5, (self.H - 2) * 0.5
+        span = max(1.0, min(self.W * 0.44, (self.H - 3) * 0.88))
+        count = max(2, min(8, round(2 + density * 2)))
+        for orbit in range(count):
+            radius = span * (0.28 + 0.72 * (orbit + 1) / count)
+            tilt = orbit * 0.58 + 0.18 * math.sin(t * 0.021 + orbit)
+            ct, st = math.cos(tilt), math.sin(tilt)
+
+            def point(a):
+                px, py = radius * math.cos(a), radius * 0.62 * math.sin(a)
+                return cx + px * ct - py * st, cy + (px * st + py * ct) * 0.5
+
+            steps = max(24, int(radius * math.tau * 1.5))
+            for i in range(steps):
+                a = i * math.tau / steps
+                x, y = point(a)
+                self._art_add(frame, x, y, "·", 0.15 + 0.045 * math.sin(a + orbit), orbit * 0.03)
+            a = t * (0.11 / (1 + orbit * 0.42)) * (-1 if orbit % 2 else 1) + orbit * 2.4
+            for tail in range(9, 0, -1):
+                x, y = point(a - tail * 0.04 * (-1 if orbit % 2 else 1))
+                self._art_add(frame, x, y, "·", 0.34 * (1 - tail / 11), orbit * 0.03)
+            x, y = point(a)
+            self._art_add(frame, x, y, "●" if orbit % 2 == 0 else "•", 0.70, orbit * 0.03)
+        self._art_add(frame, cx, cy, "◉", 0.46 + 0.05 * math.sin(t * 0.2))
+
+    def _render_ripple(self, frame, dt, density):
+        """Sparse water rings; manual pebbles share the gentle automatic tide."""
+        self.ripple_wait -= dt
+        if self.pebble_pending or self.ripple_wait <= 0:
+            self.ripples.append([
+                self.rng.uniform(0.18, 0.82) * max(1, self.W - 1),
+                self.rng.uniform(0.20, 0.75) * max(1, self.H - 2),
+                0.0, self.rng.uniform(-0.08, 0.08),
+            ])
+            self.ripples = self.ripples[-12:]
+            self.ripple_wait = self.rng.uniform(4.5, 7.5) / max(0.35, density)
+            self.pebble_pending = False
+        lifetime = 10.0 + self.args.linger * 1.8
+        speed = max(1.0, min(self.W, self.H * 2) * 0.045)
+        alive = []
+        for ripple in self.ripples:
+            cx, cy, age, hue = ripple
+            age += dt
+            ripple[2] = age
+            if age >= lifetime:
+                continue
+            alive.append(ripple)
+            fade = min(1.0, age / 1.5) * (1.0 - age / lifetime) ** 1.3
+            for echo in range(3):
+                radius = age * speed - echo * 2.5
+                if radius <= 0:
+                    continue
+                steps = max(20, int(radius * math.tau * 1.4))
+                for i in range(steps):
+                    a = i * math.tau / steps
+                    x, y = cx + radius * math.cos(a), cy + radius * math.sin(a) * 0.5
+                    light = fade * (0.60 - echo * 0.14) * (0.82 + 0.18 * math.sin(a))
+                    self._art_add(frame, x, y, "·" if echo else "∙", light, hue)
+        self.ripples = alive
+
+    def _render_art(self, dt, env, warmth, gbright, sleepf, out):
+        # Integrate scene time so sleep slows smoothly instead of making the
+        # scene jump backwards. Limit stalls, not normal frame-rate changes.
+        step = min(max(0.0, dt), 0.25) * sleepf
+        self.art_time += step
+        self.art_light = env * gbright
+        self.art_warmth = warmth
+        weather = (0.9 + 0.15 * math.sin(self.art_time / (self.args.weather * 60))
+                   if self.args.weather else 1.0)
+        self.art_light *= weather
+        density = clamp(self.args.density, 0.1, 3.0)
+        frame = {}
+        if self.args.style == "ripple":
+            self._render_ripple(frame, step, density)
+        else:
+            getattr(self, "_render_" + self.args.style)(frame, self.art_time, density)
+        self._emit_art_frame(frame, out)
 
     # per-frame decay factor from fps + linger seconds
     def decay(self):
@@ -626,7 +801,11 @@ class Scene:
         return q(r), q(g), q(b)
 
     def render_frame(self, t, dt, out):
-        # blank a panel region that was just closed, then re-plan any open panel
+        # Repaint after changing renderer/style, blank a panel region that was
+        # just closed, then re-plan any open panel.
+        if self._clear_scene:
+            out.append(CLEAR)
+            self._clear_scene = False
         if self._clear_rect:
             self._emit_clear(self._clear_rect, out)
             self._clear_rect = None
@@ -640,8 +819,18 @@ class Scene:
         sleepf = self._sleep_factor(t)
         gbright = dim * (0.3 + 0.7 * sleepf)  # sleep dims too, never fully 0 mid-run
 
-        if self.args.style == "breathcore":
-            self._render_breathcore(t, dt, env, warmth, sleepf, out)
+        if self.args.style != "plankton":
+            if self.args.style == "breathcore":
+                self._render_breathcore(t, dt, env * dim, warmth, sleepf, out)
+            else:
+                self._render_art(dt, env, warmth, gbright, sleepf, out)
+            # All geometric renderers share the same final overlay pass.
+            if self.overlay:
+                self._emit_panel(out)
+            else:
+                if self.breath.enabled and self.args.indicator:
+                    self._draw_indicator(env, blabel, warmth, out)
+                self._draw_hint(t, out)
             return
 
         self.update_shimmer(t, dt)
@@ -704,9 +893,15 @@ class Scene:
                 "esc          close panel (or quit)",
                 "",
                 "in settings —",
-                "  j / k      move selection",
-                "  ← / →      change value  (or - / +)",
-                "  space      toggle / cycle",
+                "  ↑ / ↓      choose setting  (or k / j)",
+                "  ← / →      change value    (or - / +)",
+                "  enter      select / cycle",
+                "  esc        close settings",
+                "",
+                "style: " + self.args.style,
+                STYLE_NOTES[self.args.style],
+                "space        drop a pebble (ripple scene)",
+                "Changes preview live; settings last this run.",
             ]
             footer = "esc or h to close"
             sel = None
@@ -714,7 +909,8 @@ class Scene:
             title = "driftlight — settings"
             lw = max(len(f["label"]) for f in self.fields)
             entries = [f"{f['label']:<{lw}}   {f['val']()}" for f in self.fields]
-            footer = "j/k move · ←/→ or -/+ change · esc close"
+            entries += ["", STYLE_NOTES[self.args.style]]
+            footer = "↑/↓ choose · ←/→ change · enter select · esc close"
             sel = self.sel
         need = max([len(title) + 2, len(footer) + 2] + [len("▸ " + e) for e in entries])
         w = min(need + 2, self.W)
@@ -732,6 +928,19 @@ class Scene:
         hl = self.emit_color(240, 248, 248)
         ti = self.emit_color(120, 205, 190)
         ft = self.emit_color(110, 132, 132)
+        # Short terminals get a scrollable selection window. Never emit rows
+        # outside the viewport (which would scroll/freeze-looking overlays).
+        if h < 5 or w < 12:
+            message = "s settings / esc close"[:max(0, w - 1)]
+            out.append(move(top, left) + base + message)
+            return
+        visible = max(1, h - 4)
+        start = min(max(0, (sel or 0) - visible + 1), max(0, len(entries) - visible))
+        entries = entries[start:start + visible]
+        if sel is not None:
+            sel -= start
+        if w < 52:
+            footer = "↑↓ row  ←→ value  esc close"
         # top border with inset title
         bar = list("─" * (w - 2))
         for i, chh in enumerate(f" {title} "):
@@ -759,25 +968,24 @@ class Scene:
             out.append(move(r, left) + blank)
             for c in range(left, left + w):
                 self.disp.pop(r * self.W + c, None)
+                self.style_disp.pop(r * self.W + c, None)
 
     def _draw_hint(self, t, out):
-        # a soft, self-erasing discoverability hint for the first few seconds
-        txt = " h help · s settings · q quit "
-        col = max(0, (self.W - len(txt)) // 2)
+        # Keep the controls discoverable. The low-luminance footer stays out
+        # of the way but makes Settings genuinely available without memory.
+        txt = (" s settings · h help · space pebble · q quit "
+               if self.args.style == "ripple" else " s settings · h help · q quit ")
+        available = self.W - (11 if self.breath.enabled and self.args.indicator else 1)
+        txt = txt[:max(0, available)]
+        col = max(0, (available - len(txt)) // 2)
         row = self.H - 1
-        if t < 6.0:
-            out.append(move(row, col) + self.emit_color(70, 90, 90) + txt)
-        elif not self._hint_done:
-            self._hint_done = True
-            out.append(move(row, col) + " " * len(txt))
-            for c in range(col, col + len(txt)):
-                self.disp.pop(row * self.W + c, None)
+        out.append(move(row, col) + self.emit_color(58, 75, 75) + txt)
 
     def _draw_indicator(self, env, label, warmth, out):
         dot = glyph_for(clamp(0.2 + env * 0.8))
         base = mix((90, 120, 120), AMBER, warmth)
         r, g, b = (int(c * (0.35 + 0.65 * env)) for c in base)
-        text = f"{label:<7}{dot}"
+        text = f"{label:<7}{dot}"[:max(0, self.W - 1)]
         row = self.H - 1
         col = max(0, self.W - len(text) - 1)
         out.append(move(row, col) + self.emit_color(r, g, b) + text)
@@ -928,12 +1136,18 @@ def build_parser():
   driftlight --palette violet --density 0.6
   driftlight --sleep 30              # wind down to stillness over 30 min
   driftlight --breath box            # 4-4-4-4 box breathing
+  driftlight --style contour --palette ice
+  driftlight --style ribbons --palette violet
+  driftlight --style orrery --palette ember
+  driftlight --style ripple          # Space drops a pebble
+
+Live: S settings; arrows change rows/values; Enter selects; Esc closes.
 """,
     )
     p.add_argument("--palette", choices=sorted(PALETTES), default="teal",
                    help="color mood / starting point (default: teal)")
-    p.add_argument("--style", choices=("plankton", "breathcore"), default="plankton",
-                   help="scene style (default: plankton; breathcore is a breathing central tide)")
+    p.add_argument("--style", choices=STYLES, default="plankton",
+                   help="scene geometry; change live in Settings (default: plankton)")
     p.add_argument("--hue", type=int, default=0, metavar="DEG",
                    help="rotate the palette hue by DEG degrees, -180..180 (default 0)")
     p.add_argument("--saturation", type=float, default=1.0,
@@ -941,11 +1155,11 @@ def build_parser():
     p.add_argument("--brightness", type=float, default=1.0,
                    help="overall brightness gain, 0.3..1.8 (default 1.0)")
     p.add_argument("--glow", type=float, default=0.5,
-                   help="how long faint points linger, 0..1 (default 0.5)")
+                   help="lift faint marks, 0..1 (default 0.5)")
     p.add_argument("--density", type=float, default=1.0,
-                   help="how much plankton (0.2 sparse .. 2.0 dense; default 1.0)")
+                   help="scene detail / activity (0.2 sparse .. 2.0 dense; default 1.0)")
     p.add_argument("--linger", type=float, default=3.2,
-                   help="seconds a flash takes to fade (default 3.2)")
+                   help="plankton fade / ripple lifetime (default 3.2 seconds)")
     p.add_argument("--fps", type=int, default=22, help="frames per second (default 22)")
     p.add_argument("--breath", default="off", metavar="SPEC",
                    help="breath-sync: 'off', '4-7-8', 'box', or 'a-b-c' / 'a-b-c-d'")
